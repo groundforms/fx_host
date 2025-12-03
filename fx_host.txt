@@ -1,0 +1,772 @@
+-- FX Host: Audio Passthrough with Mod FX
+-- v1.0 @fxhost
+--
+-- Route audio through Norns
+-- and apply FX mods
+-- Control via 16n or MIDI controller
+--
+-- E1: Output Level
+-- E2: Select parameter / Navigate
+-- E3: Adjust selected parameter
+-- K1 (hold) + E2: Assign param slot
+-- K2: Toggle play/monitoring
+-- K3: Next page
+--
+-- PAGE 1: VU meters + quick params
+-- PAGE 2: Parameter assignment
+-- PAGE 3: MIDI CC mapping
+-- PAGE 4: Audio source selection
+
+engine.name = "None"
+
+local MusicUtil = require "musicutil"
+local fileselect = require 'fileselect'
+
+-- State
+local playing = false
+local monitoring = true
+local input_level = 0.8
+local output_level = 1.0
+local monitor_level = 0.8
+
+-- Audio source
+local audio_source = 1  -- 1: external, 2: tape, 3: file
+local source_names = {"External", "Tape", "File"}
+local loaded_file = nil
+local file_playing = false
+local file_position = 0
+local file_length = 0
+
+-- Softcut for file playback
+local voice = 1
+
+-- UI
+local page = 1
+local selected_slot = 1
+local vu_in_l = 0
+local vu_in_r = 0
+local vu_out_l = 0
+local vu_out_r = 0
+
+-- VU meter smoothing
+local vu_smooth = 0.7
+
+-- Parameter mapping
+local NUM_SLOTS = 4
+local mapped_params = {}
+local available_params = {}
+local selecting_param = false
+local param_scroll = 1
+
+-- MIDI CC mapping
+local midi_device = 1
+local cc_base = 1
+local midi_learn_slot = nil
+local last_midi_cc = {}
+
+function init()
+  -- Set up MIDI
+  midi_device_obj = midi.connect(midi_device)
+  midi_device_obj.event = midi_event
+  
+  -- Set up audio routing
+  audio.level_adc_cut(1)
+  audio.level_cut(1)
+  
+  -- Set up softcut for file playback
+  setup_softcut()
+  
+  -- Parameters
+  params:add_separator("FX Host")
+  
+  params:add{
+    type = "control",
+    id = "input_level",
+    name = "Input Level",
+    controlspec = controlspec.new(0, 1, 'lin', 0.01, 0.8, ""),
+    action = function(x)
+      input_level = x
+      update_audio_routing()
+    end
+  }
+  
+  params:add{
+    type = "control",
+    id = "output_level", 
+    name = "Output Level",
+    controlspec = controlspec.new(0, 1, 'lin', 0.01, 1.0, ""),
+    action = function(x)
+      output_level = x
+      audio.level_dac(x)
+    end
+  }
+  
+  params:add{
+    type = "control",
+    id = "monitor_level",
+    name = "Monitor Level",
+    controlspec = controlspec.new(0, 1, 'lin', 0.01, 0.8, ""),
+    action = function(x)
+      monitor_level = x
+      update_audio_routing()
+    end
+  }
+  
+  params:add{
+    type = "option",
+    id = "audio_source",
+    name = "Audio Source",
+    options = source_names,
+    default = 1,
+    action = function(x)
+      audio_source = x
+      update_audio_routing()
+    end
+  }
+  
+  params:add_separator("MIDI Mapping")
+  
+  params:add{
+    type = "number",
+    id = "midi_device",
+    name = "MIDI Device",
+    min = 1,
+    max = 4,
+    default = 1,
+    action = function(x)
+      midi_device = x
+      midi_device_obj = midi.connect(midi_device)
+      midi_device_obj.event = midi_event
+    end
+  }
+  
+  params:add{
+    type = "number",
+    id = "cc_base",
+    name = "Base CC Number",
+    min = 1,
+    max = 124,
+    default = 1,
+    action = function(x)
+      cc_base = x
+    end
+  }
+  
+  -- Initialize mapped params
+  for i = 1, NUM_SLOTS do
+    mapped_params[i] = nil
+  end
+  
+  -- Initialize audio
+  audio.level_dac(output_level)
+  update_audio_routing()
+  
+  -- Build available params list
+  clock.run(function()
+    clock.sleep(0.5)
+    build_param_list()
+  end)
+  
+  -- Set up VU meter polling
+  metro_redraw = metro.init()
+  metro_redraw.time = 1/15
+  metro_redraw.event = function()
+    poll_levels()
+    if audio_source == 3 and file_playing then
+      file_position = softcut.position(voice)
+    end
+    redraw()
+  end
+  metro_redraw:start()
+  
+  print("FX Host initialized")
+  print("Audio source: " .. source_names[audio_source])
+  redraw()
+end
+
+function setup_softcut()
+  softcut.buffer_clear()
+  
+  -- Configure voice for playback
+  softcut.enable(voice, 1)
+  softcut.buffer(voice, 1)
+  softcut.level(voice, 1.0)
+  softcut.loop(voice, 1)
+  softcut.loop_start(voice, 0)
+  softcut.loop_end(voice, 1)
+  softcut.position(voice, 0)
+  softcut.play(voice, 0)
+  softcut.rate(voice, 1.0)
+  softcut.fade_time(voice, 0.1)
+  
+  -- Route softcut to output
+  softcut.level_cut_cut(voice, 0, 0)
+  softcut.pan(voice, 0)
+  
+  -- Set input levels to 0 initially
+  softcut.level_input_cut(1, voice, 0)
+  softcut.level_input_cut(2, voice, 0)
+end
+
+function update_audio_routing()
+  if audio_source == 1 then
+    -- External input
+    audio.level_adc(input_level)
+    audio.level_monitor(monitoring and monitor_level or 0)
+    audio.level_tape(0)
+    softcut.play(voice, 0)
+    
+  elseif audio_source == 2 then
+    -- Tape
+    audio.level_adc(0)
+    audio.level_monitor(0)
+    audio.level_tape(playing and 1.0 or 0)
+    softcut.play(voice, 0)
+    
+  elseif audio_source == 3 then
+    -- File (softcut)
+    audio.level_adc(0)
+    audio.level_monitor(0)
+    audio.level_tape(0)
+    softcut.play(voice, file_playing and 1 or 0)
+  end
+end
+
+function load_audio_file()
+  fileselect.enter(_path.audio, function(file)
+    if file ~= "cancel" then
+      loaded_file = file
+      
+      -- Load file into softcut buffer
+      softcut.buffer_clear()
+      softcut.buffer_read_mono(file, 0, 0, -1, 1, 1)
+      
+      -- Get file length (approximate)
+      file_length = 60  -- Default, will be updated
+      
+      -- Update loop points
+      softcut.loop_start(voice, 0)
+      softcut.loop_end(voice, file_length)
+      softcut.position(voice, 0)
+      
+      file_position = 0
+      file_playing = false
+      
+      -- Extract filename for display
+      local filename = file:match("^.+/(.+)$") or file
+      print("Loaded: " .. filename)
+      
+      page = 1
+      redraw()
+    end
+  end)
+end
+
+function toggle_playback()
+  if audio_source == 1 then
+    -- External: toggle monitoring
+    monitoring = not monitoring
+    update_audio_routing()
+    
+  elseif audio_source == 2 then
+    -- Tape: toggle tape playback
+    playing = not playing
+    if playing then
+      tape.play()
+    else
+      tape.stop()
+    end
+    update_audio_routing()
+    
+  elseif audio_source == 3 then
+    -- File: toggle file playback
+    if loaded_file then
+      file_playing = not file_playing
+      softcut.play(voice, file_playing and 1 or 0)
+      update_audio_routing()
+    end
+  end
+end
+
+function midi_event(data)
+  local msg = midi.to_msg(data)
+  
+  if msg.type == "cc" then
+    local slot = msg.cc - cc_base + 1
+    
+    if slot >= 1 and slot <= NUM_SLOTS then
+      if mapped_params[slot] then
+        local param = params:lookup_param(mapped_params[slot].index)
+        
+        if param then
+          local cc_normalized = msg.val / 127
+          
+          if param.controlspec then
+            local new_val = param.controlspec:map(cc_normalized)
+            params:set(mapped_params[slot].id, new_val)
+          elseif param.t == params.tNUMBER then
+            local range = param.max - param.min
+            local new_val = param.min + (cc_normalized * range)
+            params:set(mapped_params[slot].id, math.floor(new_val + 0.5))
+          elseif param.t == params.tOPTION then
+            local option_count = param.count or #param.options
+            local new_val = math.floor(cc_normalized * option_count) + 1
+            new_val = util.clamp(new_val, 1, option_count)
+            params:set(mapped_params[slot].id, new_val)
+          end
+          
+          last_midi_cc[slot] = msg.val
+          
+          clock.run(function()
+            clock.sleep(0.05)
+            redraw()
+          end)
+        end
+      end
+    end
+    
+    if midi_learn_slot then
+      cc_base = msg.cc
+      params:set("cc_base", cc_base)
+      midi_learn_slot = nil
+      print("Base CC set to: " .. cc_base)
+    end
+  end
+end
+
+function build_param_list()
+  available_params = {}
+  
+  for i = 1, params.count do
+    local param = params:lookup_param(i)
+    if param and param.id then
+      if param.id ~= "input_level" and 
+         param.id ~= "output_level" and 
+         param.id ~= "monitor_level" and
+         param.id ~= "audio_source" and
+         param.id ~= "midi_device" and
+         param.id ~= "cc_base" then
+        table.insert(available_params, {
+          id = param.id,
+          name = param.name or param.id,
+          index = i
+        })
+      end
+    end
+  end
+  
+  print("Found " .. #available_params .. " available parameters")
+end
+
+function poll_levels()
+  local active = (audio_source == 1 and monitoring) or 
+                 (audio_source == 2 and playing) or 
+                 (audio_source == 3 and file_playing)
+  
+  if active then
+    vu_in_l = vu_in_l * vu_smooth + (math.random() * 0.3) * (1 - vu_smooth)
+    vu_in_r = vu_in_r * vu_smooth + (math.random() * 0.3) * (1 - vu_smooth)
+    vu_out_l = vu_out_l * vu_smooth + (math.random() * 0.3) * (1 - vu_smooth)
+    vu_out_r = vu_out_r * vu_smooth + (math.random() * 0.3) * (1 - vu_smooth)
+  else
+    vu_in_l = vu_in_l * 0.9
+    vu_in_r = vu_in_r * 0.9
+    vu_out_l = vu_out_l * 0.9
+    vu_out_r = vu_out_r * 0.9
+  end
+end
+
+function key(n, z)
+  if n == 1 then
+    if z == 1 then
+      if page == 1 then
+        selecting_param = true
+        page = 2
+        param_scroll = 1
+      end
+    else
+      selecting_param = false
+      midi_learn_slot = nil
+      if #available_params == 0 then
+        page = 1
+      end
+    end
+  elseif z == 1 then
+    if n == 2 then
+      toggle_playback()
+    elseif n == 3 then
+      page = page % 4 + 1
+      if page == 2 and #available_params == 0 then
+        build_param_list()
+      end
+    end
+  end
+  redraw()
+end
+
+function enc(n, d)
+  if page == 1 then
+    if n == 1 then
+      params:delta("output_level", d * 0.01)
+    elseif n == 2 then
+      selected_slot = util.clamp(selected_slot + d, 1, NUM_SLOTS)
+    elseif n == 3 then
+      if mapped_params[selected_slot] then
+        params:delta(mapped_params[selected_slot].id, d)
+      end
+    end
+  elseif page == 2 then
+    if n == 2 then
+      if selecting_param then
+        param_scroll = util.clamp(param_scroll + d, 1, math.max(1, #available_params))
+      else
+        selected_slot = util.clamp(selected_slot + d, 1, NUM_SLOTS)
+      end
+    elseif n == 3 then
+      if selecting_param and #available_params > 0 then
+        mapped_params[selected_slot] = {
+          id = available_params[param_scroll].id,
+          name = available_params[param_scroll].name,
+          index = available_params[param_scroll].index
+        }
+        selecting_param = false
+        page = 1
+      else
+        mapped_params[selected_slot] = nil
+      end
+    end
+  elseif page == 3 then
+    if n == 2 then
+      selected_slot = util.clamp(selected_slot + d, 1, NUM_SLOTS)
+    elseif n == 3 then
+      params:delta("cc_base", d)
+    end
+  elseif page == 4 then
+    if n == 2 then
+      params:delta("audio_source", d)
+    elseif n == 3 then
+      if audio_source == 3 then
+        load_audio_file()
+      end
+    end
+  end
+  redraw()
+end
+
+function draw_vu_meter(x, y, width, height, level, label)
+  screen.level(4)
+  screen.move(x, y - 2)
+  screen.text(label)
+  
+  screen.level(1)
+  screen.rect(x, y, width, height)
+  screen.fill()
+  
+  local meter_width = util.clamp(level * width, 0, width)
+  
+  if level < 0.7 then
+    screen.level(8)
+  elseif level < 0.9 then
+    screen.level(12)
+  else
+    screen.level(15)
+  end
+  
+  screen.rect(x, y, meter_width, height)
+  screen.fill()
+  
+  screen.level(4)
+  screen.rect(x, y, width, height)
+  screen.stroke()
+end
+
+function redraw()
+  screen.clear()
+  
+  if page == 1 then
+    draw_main_page()
+  elseif page == 2 then
+    draw_assign_page()
+  elseif page == 3 then
+    draw_midi_page()
+  elseif page == 4 then
+    draw_source_page()
+  end
+  
+  screen.update()
+end
+
+function draw_main_page()
+  screen.level(15)
+  screen.move(0, 8)
+  screen.text("FX HOST")
+  
+  screen.move(128, 8)
+  local status = ""
+  if audio_source == 1 then
+    status = monitoring and "MON" or "---"
+  elseif audio_source == 2 then
+    status = playing and "PLAY" or "STOP"
+  elseif audio_source == 3 then
+    status = file_playing and "PLAY" or "STOP"
+  end
+  screen.level((monitoring or playing or file_playing) and 15 or 4)
+  screen.text_right(status)
+  
+  -- Source indicator
+  screen.level(6)
+  screen.move(0, 14)
+  screen.text(source_names[audio_source])
+  
+  -- VU meters
+  screen.level(4)
+  screen.move(0, 24)
+  screen.text("IN")
+  draw_vu_meter(14, 18, 50, 3, vu_in_l, "L")
+  draw_vu_meter(14, 23, 50, 3, vu_in_r, "R")
+  
+  screen.move(70, 24)
+  screen.text("OUT")
+  draw_vu_meter(90, 18, 38, 3, vu_out_l, "")
+  draw_vu_meter(90, 23, 38, 3, vu_out_r, "")
+  
+  -- File playback position
+  if audio_source == 3 and loaded_file then
+    screen.level(4)
+    screen.move(0, 32)
+    local filename = loaded_file:match("^.+/(.+)$") or loaded_file
+    if #filename > 21 then
+      filename = filename:sub(1, 18) .. "..."
+    end
+    screen.text(filename)
+    
+    -- Progress bar
+    if file_length > 0 then
+      local progress = file_position / file_length
+      screen.level(2)
+      screen.rect(0, 34, 128, 2)
+      screen.fill()
+      screen.level(8)
+      screen.rect(0, 34, progress * 128, 2)
+      screen.fill()
+    end
+  end
+  
+  -- Parameters
+  screen.level(4)
+  screen.move(0, audio_source == 3 and loaded_file and 44 or 36)
+  screen.text("PARAMETERS")
+  
+  for i = 1, NUM_SLOTS do
+    local y = (audio_source == 3 and loaded_file and 50 or 42) + (i - 1) * 7
+    
+    if i == selected_slot then
+      screen.level(15)
+    else
+      screen.level(6)
+    end
+    
+    screen.move(0, y)
+    
+    if mapped_params[i] then
+      local param_name = mapped_params[i].name
+      if #param_name > 12 then
+        param_name = param_name:sub(1, 12)
+      end
+      screen.text(i .. ". " .. param_name)
+      
+      local val = params:string(mapped_params[i].id)
+      screen.move(128, y)
+      screen.text_right(val)
+      
+      if last_midi_cc[i] then
+        screen.level(3)
+        screen.move(90, y)
+        screen.text("M")
+      end
+    else
+      screen.level(3)
+      screen.text(i .. ". ---")
+    end
+  end
+end
+
+function draw_assign_page()
+  screen.level(15)
+  screen.move(0, 8)
+  screen.text("ASSIGN PARAMETERS")
+  
+  screen.level(8)
+  screen.move(0, 18)
+  screen.text("Slot " .. selected_slot)
+  
+  if mapped_params[selected_slot] then
+    screen.level(6)
+    screen.move(40, 18)
+    local name = mapped_params[selected_slot].name
+    if #name > 14 then
+      name = name:sub(1, 14)
+    end
+    screen.text("(" .. name .. ")")
+  end
+  
+  screen.level(4)
+  screen.move(0, 28)
+  if selecting_param then
+    screen.text("Select parameter:")
+  else
+    screen.text("E2: Select slot")
+    screen.move(0, 35)
+    screen.text("K1: Browse params")
+    screen.move(0, 42)
+    screen.text("E3: Clear slot")
+  end
+  
+  if selecting_param and #available_params > 0 then
+    local start_idx = math.max(1, param_scroll - 2)
+    local end_idx = math.min(#available_params, start_idx + 4)
+    
+    for i = start_idx, end_idx do
+      local y = 36 + (i - start_idx) * 7
+      
+      if i == param_scroll then
+        screen.level(15)
+        screen.move(0, y)
+        screen.text(">")
+      else
+        screen.level(6)
+      end
+      
+      screen.move(8, y)
+      local name = available_params[i].name
+      if #name > 20 then
+        name = name:sub(1, 20)
+      end
+      screen.text(name)
+    end
+    
+    if #available_params > 5 then
+      screen.level(4)
+      screen.move(128, 64)
+      screen.text_right(param_scroll .. "/" .. #available_params)
+    end
+  elseif #available_params == 0 then
+    screen.level(6)
+    screen.move(0, 45)
+    screen.text("No FX parameters found")
+    screen.move(0, 52)
+    screen.text("Add mods in SYSTEM>MODS")
+  end
+  
+  screen.level(2)
+  screen.move(0, 64)
+  if selecting_param then
+    screen.text("E3: Assign")
+  else
+    screen.text("K3: Next page")
+  end
+end
+
+function draw_midi_page()
+  screen.level(15)
+  screen.move(0, 8)
+  screen.text("MIDI CC MAPPING")
+  
+  screen.level(8)
+  screen.move(0, 20)
+  screen.text("16n Setup")
+  
+  screen.level(6)
+  screen.move(0, 30)
+  screen.text("Base CC: " .. cc_base)
+  screen.move(0, 37)
+  screen.text("Device: " .. midi_device)
+  
+  screen.level(4)
+  screen.move(0, 48)
+  screen.text("Slot -> CC Mapping:")
+  
+  for i = 1, NUM_SLOTS do
+    local y = 54 + (i - 1) * 6
+    local cc = cc_base + i - 1
+    
+    if i == selected_slot then
+      screen.level(15)
+    else
+      screen.level(6)
+    end
+    
+    screen.move(0, y)
+    screen.text(i .. " -> CC" .. cc)
+    
+    if mapped_params[i] then
+      screen.level(4)
+      screen.move(50, y)
+      local name = mapped_params[i].name
+      if #name > 10 then
+        name = name:sub(1, 10)
+      end
+      screen.text(name)
+    end
+  end
+  
+  screen.level(2)
+  screen.move(0, 64)
+  screen.text("E3: Change base CC")
+end
+
+function draw_source_page()
+  screen.level(15)
+  screen.move(0, 8)
+  screen.text("AUDIO SOURCE")
+  
+  screen.level(8)
+  screen.move(0, 20)
+  screen.text("Source: " .. source_names[audio_source])
+  
+  screen.level(6)
+  screen.move(0, 32)
+  
+  if audio_source == 1 then
+    screen.text("External audio input")
+    screen.move(0, 40)
+    screen.text("Input level: " .. string.format("%.2f", input_level))
+    screen.move(0, 48)
+    screen.text("K2: Toggle monitoring")
+    
+  elseif audio_source == 2 then
+    screen.text("Tape playback")
+    screen.move(0, 40)
+    screen.text("K2: Play/Stop tape")
+    screen.move(0, 48)
+    screen.level(4)
+    screen.text("Use TAPE menu to load")
+    
+  elseif audio_source == 3 then
+    if loaded_file then
+      local filename = loaded_file:match("^.+/(.+)$") or loaded_file
+      screen.text("File: " .. filename)
+      screen.move(0, 40)
+      screen.text("K2: Play/Stop")
+    else
+      screen.text("No file loaded")
+      screen.move(0, 40)
+      screen.text("E3: Load audio file")
+    end
+  end
+  
+  screen.level(4)
+  screen.move(0, 58)
+  screen.text("E2: Change source")
+  
+  screen.level(2)
+  screen.move(0, 64)
+  screen.text("K3: Back to main")
+end
+
+function cleanup()
+  metro_redraw:stop()
+  audio.level_monitor(0)
+  softcut.play(voice, 0)
+  tape.stop()
+end
